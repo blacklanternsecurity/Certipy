@@ -44,6 +44,7 @@ from certipy.lib.errors import handle_error
 from certipy.lib.files import try_to_save_file
 from certipy.lib.formatting import pretty_print
 from certipy.lib.kerberos import HttpxKerberosAuth
+from certipy.lib.adws import ADWSConnection
 from certipy.lib.ldap import LDAPConnection, LDAPEntry
 from certipy.lib.logger import is_verbose, logging
 from certipy.lib.ntlm import HttpxNtlmAuth, NtlmNotSupportedError
@@ -103,17 +104,22 @@ class Find:
     # =========================================================================
 
     @property
-    def connection(self) -> LDAPConnection:
+    def connection(self) -> LDAPConnection | ADWSConnection:
         """
-        Get or create an LDAP connection.
+        Get or create an LDAP or ADWS connection.
 
         Returns:
-            Active LDAP connection to the target
+            Active connection to the target (LDAP or ADWS based on target.use_adws)
         """
         if self._connection is not None:
             return self._connection
 
-        self._connection = LDAPConnection(self.target)
+        if self.target.use_adws:
+            logging.info("Using ADWS (port 9389) instead of LDAP")
+            self._connection = ADWSConnection(self.target)
+        else:
+            self._connection = LDAPConnection(self.target)
+
         self._connection.connect()
 
         return self._connection
@@ -2112,23 +2118,35 @@ class Find:
         enrollable_sids = []
         user_can_enroll = False
 
-        # Check ACEs for enrollment rights
+        # Check ACEs for enrollment rights per MS-CRTD rules
         for sid, rights in security.aces.items():
             if sid not in user_sids:
                 continue
 
-            # Check for enrollment rights (All-Extended-Rights, Enroll, or Generic All)
+            # Rule 1: ACCESS_ALLOWED_OBJECT_ACE with control access and ObjectType == Enroll GUID
+            has_object_enroll = (
+                EXTENDED_RIGHTS_NAME_MAP["Enroll"] in rights["extended_rights"]
+                and rights["rights"] & ActiveDirectoryRights.EXTENDED_RIGHT
+            )
+
+            # Preserve behavior: All-Extended-Rights also implies enrollment
+            has_all_extended = (
+                EXTENDED_RIGHTS_NAME_MAP["All-Extended-Rights"]
+                in rights["extended_rights"]
+                and rights["rights"] & ActiveDirectoryRights.EXTENDED_RIGHT
+            )
+
+            # Rule 2: ACCESS_ALLOWED_ACE with control access bit set (0x00000100)
+            # Captured by security parser as 'has_standard_control_access'
+            has_standard_control_access = rights.get(
+                "has_standard_control_access", False
+            )
+
             if (
-                (
-                    EXTENDED_RIGHTS_NAME_MAP["All-Extended-Rights"]
-                    in rights["extended_rights"]
-                    and rights["rights"] & ActiveDirectoryRights.EXTENDED_RIGHT
-                )
-                or (
-                    EXTENDED_RIGHTS_NAME_MAP["Enroll"] in rights["extended_rights"]
-                    and rights["rights"] & ActiveDirectoryRights.EXTENDED_RIGHT
-                )
-                or CertificateRights.GENERIC_ALL in rights["rights"]
+                has_object_enroll
+                or has_all_extended
+                or has_standard_control_access
+                or (CertificateRights.GENERIC_ALL in rights["rights"])
             ):
                 enrollable_sids.append(sid)
                 user_can_enroll = True
