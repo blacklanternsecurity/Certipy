@@ -30,6 +30,7 @@ from impacket.krb5.crypto import Key
 from impacket.krb5.gssapi import (
     GSS_C_CONF_FLAG,
     GSS_C_INTEG_FLAG,
+    GSS_C_MUTUAL_FLAG,
     GSS_C_REPLAY_FLAG,
     GSS_C_SEQUENCE_FLAG,
     GSS_HMAC,
@@ -579,6 +580,7 @@ def get_kerberos_type1(
     service: str = "HOST",
     channel_binding_data: Optional[bytes] = None,
     signing: bool = False,
+    mutual_auth: bool = False,
 ) -> Tuple[type, Key, bytes, str]:
     """
     Generate a Kerberos Type 1 authentication message (AP_REQ).
@@ -592,6 +594,7 @@ def get_kerberos_type1(
         service: Service type (e.g., "HTTP", "HOST")
         channel_binding_data: Optional channel binding token data for EPA
         signing: Whether to enable signing and encryption flags
+        mutual_auth: Whether to request mutual authentication (required for NNS/ADWS)
 
     Returns:
         Tuple containing:
@@ -619,7 +622,12 @@ def get_kerberos_type1(
     ap_req = AP_REQ()
     ap_req["pvno"] = 5  # Protocol version number
     ap_req["msg-type"] = e2i(constants.ApplicationTagNumbers.AP_REQ)
-    ap_req["ap-options"] = constants.encodeFlags([])  # No options by default
+    if mutual_auth:
+        ap_req["ap-options"] = constants.encodeFlags(
+            [e2i(constants.APOptions.mutual_required)]
+        )
+    else:
+        ap_req["ap-options"] = constants.encodeFlags([])
     seq_set(ap_req, "ticket", ticket.to_asn1)
 
     # Create authenticator
@@ -644,6 +652,8 @@ def get_kerberos_type1(
     flags = GSS_C_SEQUENCE_FLAG | GSS_C_REPLAY_FLAG
     if signing:
         flags |= GSS_C_CONF_FLAG | GSS_C_INTEG_FLAG
+    if mutual_auth:
+        flags |= GSS_C_MUTUAL_FLAG
 
     checksum["Flags"] = flags
 

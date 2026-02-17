@@ -79,18 +79,22 @@ class ADWSConnection:
                 auth = NTLMAuth(password=self.target.password)
 
         # Create ADWS client
-        # Use target_ip or dc_ip as the server address
+        # Use target_ip or dc_ip as the resolved IP for TCP connection
         server = self.target.target_ip or self.target.dc_ip
         if server is None:
             raise Exception("No server address available (target_ip or dc_ip)")
 
+        # Use FQDN for NMF via header and Kerberos SPN, IP for socket connection
+        fqdn = self.target.remote_name or self.target.dc_host or server
+
         logging.info(f"Connecting to ADWS at {server}:9389")
 
         self._client = ADWSConnect.pull_client(
-            ip=server,
+            ip=fqdn,
             domain=self.target.domain,
             username=self.target.username,
             auth=auth,
+            target_ip=server,
         )
 
         # Set up paths based on domain

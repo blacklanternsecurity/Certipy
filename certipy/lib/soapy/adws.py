@@ -274,8 +274,9 @@ class ADWSConnect:
         fqdn: str,
         domain: str,
         username: str,
-        auth: NTLMAuth,
+        auth: NTLMAuth | KerberosAuth,
         resource: str,
+        target_ip: str | None = None,
     ):
         """Creates an ADWS client connection to the specified endpoint
         useing the specified auth.  Allows for making different types of
@@ -289,12 +290,14 @@ class ADWSConnect:
             fqdn (str): fqdn of the domain controler the adws service is running on
             domain (str): the domain
             username (str): user to auth as
-            auth (NTLMAuth): auth mechanism to use
+            auth (NTLMAuth | KerberosAuth): auth mechanism to use
             resource (str): the resource dictates what endpoint the client
                 connects to which in turn dictates what types of requests
                 it can make
+            target_ip (str | None): resolved IP for TCP connection (uses fqdn if not set)
         """
         self._fqdn = fqdn
+        self._target_ip = target_ip or fqdn
         self._domain = domain
         self._username = username
         self._auth = auth
@@ -329,17 +332,16 @@ class ADWSConnect:
         raise NotImplementedError(f"Unsupported auth type: {type(self._auth)}")
 
     def _connect(self, remoteName: str, resource: str) -> ms_nmf.NMFConnection:
-        """Connect to the specified ADWS endpoint at the
-        remoteName
+        """Connect to the specified ADWS endpoint.
 
         Args:
-            remoteName (str): fqdn
+            remoteName (str): fqdn (used for NMF via header and SPN)
             resource (str): endpoint to connect to <'Resource', 'ResourceFactory',
                 'Enumeration', AccountManagement',  'TopologyManagement'>
         """
-
-        server_address: tuple[str, int] = (remoteName, 9389)
-        logging.info(f"Connecting to {remoteName} for {self._resource}")
+        connect_host = self._target_ip
+        server_address: tuple[str, int] = (connect_host, 9389)
+        logging.debug(f"Connecting to ADWS at {connect_host}:9389 for {self._resource}")
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect(server_address)
@@ -769,30 +771,30 @@ class ADWSConnect:
         return results
 
     @classmethod
-    def pull_client(cls, ip: str, domain: str, username: str, auth: NTLMAuth) -> Self:
-        return cls(ip, domain, username, auth, "Enumeration")
+    def pull_client(cls, ip: str, domain: str, username: str, auth: NTLMAuth | KerberosAuth, target_ip: str | None = None) -> Self:
+        return cls(ip, domain, username, auth, "Enumeration", target_ip=target_ip)
 
     @classmethod
-    def put_client(cls, ip: str, domain: str, username: str, auth: NTLMAuth) -> Self:
-        return cls(ip, domain, username, auth, "Resource")
+    def put_client(cls, ip: str, domain: str, username: str, auth: NTLMAuth | KerberosAuth, target_ip: str | None = None) -> Self:
+        return cls(ip, domain, username, auth, "Resource", target_ip=target_ip)
 
     @classmethod
     def create_client(
-        cls, ip: str, domain: str, username: str, auth: NTLMAuth
+        cls, ip: str, domain: str, username: str, auth: NTLMAuth | KerberosAuth
     ) -> Self:
         # return cls(ip, domain, username, auth, "ResourceFactory")
         raise NotImplementedError()
 
     @classmethod
     def accounts_cap_client(
-        cls, ip: str, domain: str, username: str, auth: NTLMAuth
+        cls, ip: str, domain: str, username: str, auth: NTLMAuth | KerberosAuth
     ) -> Self:
         # return cls(ip, domain, username, auth, "AccountManagement")
         raise NotImplementedError()
 
     @classmethod
     def topology_cap_client(
-        cls, ip: str, domain: str, username: str, auth: NTLMAuth
+        cls, ip: str, domain: str, username: str, auth: NTLMAuth | KerberosAuth
     ) -> Self:
         # return cls(ip, domain, username, auth, "TopologyManagement")
         raise NotImplementedError()

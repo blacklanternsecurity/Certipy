@@ -8,6 +8,10 @@ import impacket.spnego
 import impacket.structure
 from Cryptodome.Cipher import ARC4
 from impacket.hresult_errors import ERROR_MESSAGES
+from impacket.krb5.asn1 import AP_REP, EncAPRepPart
+from impacket.krb5.crypto import Key as KerberosKey
+from impacket.spnego import SPNEGO_NegTokenResp
+from pyasn1.codec.ber import decoder
 
 from .encoder.records.utils import Net7BitInteger
 
@@ -464,31 +468,31 @@ class NNS:
             raise SystemExit(f"[-] NTLM Auth Failed with error {err_type} {err_msg}")
 
     def auth_kerberos(self) -> None:
-        """Authenticate using Kerberos via SPNEGO.
+        """Authenticate using Kerberos via SPNEGO with mutual authentication.
 
         Uses Certipy's existing Kerberos implementation to get a Kerberos
-        AP_REQ blob and authenticate over the NNS protocol.
+        AP_REQ blob and authenticate over the NNS protocol. Handles the
+        multi-round NNS handshake for mutual auth and extracts the server's
+        subkey from the AP_REP for subsequent channel encryption.
         """
         if self._kerberos_target is None:
             raise ValueError("Kerberos target not set - cannot perform Kerberos auth")
 
         from certipy.lib.kerberos import get_kerberos_type1, KerberosCipher
 
-        # Get Kerberos AP_REQ blob using Certipy's existing function
-        # Use ldap SPN for ADWS service - must use hostname, not IP for Kerberos
-        # Pass service="ldap" separately since get_kerberos_type1 constructs SPN as {service}/{target_name}
-        # Note: get_kerberos_type1 returns a complete SPNEGO NegTokenInit token, not raw AP_REQ
+        # Step 1: Get Kerberos AP_REQ with mutual auth via SPNEGO
+        # ADWS uses HOST/<fqdn> SPN (not ldap)
         kerberos_hostname = self._kerberos_target.remote_name or self._kerberos_target.dc_host or self._fqdn
         cipher, session_key, spnego_token, username = get_kerberos_type1(
             self._kerberos_target,
             target_name=kerberos_hostname,
-            service="ldap",
+            service="HOST",
             channel_binding_data=None,
             signing=True,
+            mutual_auth=True,
         )
 
-        # Send NNS handshake with SPNEGO token
-        # The spnego_token from get_kerberos_type1 is already a complete SPNEGO NegTokenInit
+        # Step 2: Send SPNEGO token via NNS handshake
         NNS_handshake(
             message_id=MessageID.IN_PROGRESS,
             major_version=1,
@@ -496,8 +500,8 @@ class NNS:
             payload=spnego_token,
         ).send(self._sock)
 
-        # Receive response
-        NNS_msg_done = NNS_handshake(
+        # Step 3: Receive server response
+        NNS_msg_resp = NNS_handshake(
             message_id=int.from_bytes(self._sock.recv(1), "big"),
             major_version=int.from_bytes(self._sock.recv(1), "big"),
             minor_version=int.from_bytes(self._sock.recv(1), "big"),
@@ -505,21 +509,71 @@ class NNS:
         )
 
         # Check for errors
-        if NNS_msg_done["message_id"] == MessageID.ERROR:
-            # Try to extract error details from payload
-            try:
-                err_code = int.from_bytes(NNS_msg_done["payload"], "big")
-                if err_code in ERROR_MESSAGES:
-                    err_type, err_msg = ERROR_MESSAGES[err_code]
-                    raise SystemExit(f"[-] Kerberos Auth Failed with error {err_type}: {err_msg}")
-                else:
-                    raise SystemExit(f"[-] Kerberos Auth Failed with error code: 0x{err_code:08X}")
-            except (ValueError, KeyError):
-                raise SystemExit(f"[-] Kerberos Auth Failed")
+        if NNS_msg_resp["message_id"] == MessageID.ERROR:
+            err_code = int.from_bytes(NNS_msg_resp["payload"], "big")
+            if err_code in ERROR_MESSAGES:
+                err_type, err_msg = ERROR_MESSAGES[err_code]
+                raise SystemExit(f"[-] Kerberos Auth Failed: {err_type} {err_msg}")
+            raise SystemExit(f"[-] Kerberos Auth Failed with error code: 0x{err_code:08X}")
 
-        # Set up Kerberos cipher for encryption
-        self._kerberos_cipher = KerberosCipher(cipher, session_key)
+        # Step 4: Handle mutual auth multi-round handshake
+        server_payload = NNS_msg_resp["payload"]
+        if NNS_msg_resp["message_id"] == MessageID.IN_PROGRESS:
+            # Server needs another round — send empty DONE to complete
+            NNS_handshake(
+                message_id=MessageID.DONE,
+                major_version=1,
+                minor_version=0,
+                payload=b'',
+            ).send(self._sock)
+
+            # Receive final DONE
+            NNS_msg_final = NNS_handshake(
+                message_id=int.from_bytes(self._sock.recv(1), "big"),
+                major_version=int.from_bytes(self._sock.recv(1), "big"),
+                minor_version=int.from_bytes(self._sock.recv(1), "big"),
+                payload=self._sock.recv(int.from_bytes(self._sock.recv(2), "big")),
+            )
+            if NNS_msg_final["message_id"] == MessageID.ERROR:
+                err_code = int.from_bytes(NNS_msg_final["payload"], "big")
+                raise SystemExit(f"[-] Kerberos Auth Failed at final step with error code: 0x{err_code:08x}")
+
+        elif NNS_msg_resp["message_id"] != MessageID.DONE:
+            raise SystemExit(f"[-] Kerberos Auth: Unexpected message ID: 0x{NNS_msg_resp['message_id']:02x}")
+
+        # Step 5: Process AP_REP to extract subkey (if present)
+        # The server's response contains a SPNEGO NegTokenResp wrapping an AP_REP.
+        # The AP_REP may contain a subkey that MUST be used for subsequent encryption.
+        enc_key = session_key
+        if server_payload and len(server_payload) > 0:
+            try:
+                spnego_resp = SPNEGO_NegTokenResp(server_payload)
+                ap_rep_data = spnego_resp['ResponseToken']
+                if ap_rep_data and len(ap_rep_data) > 0:
+                    raw_token = bytes(ap_rep_data)
+                    # The ResponseToken may be wrapped in a GSS-API InitialContextToken
+                    # (APPLICATION 0 = 0x60). Find the actual AP_REP (APPLICATION 15 = 0x6F).
+                    if raw_token[0] != 0x6F:
+                        ap_rep_idx = raw_token.find(b'\x6f')
+                        if ap_rep_idx >= 0:
+                            raw_token = raw_token[ap_rep_idx:]
+                        else:
+                            raise ValueError('No AP_REP (0x6F) found in ResponseToken')
+                    ap_rep = decoder.decode(raw_token, asn1Spec=AP_REP())[0]
+                    enc_part = ap_rep['enc-part']
+                    # Decrypt AP_REP enc-part with TGS session key (key usage 12)
+                    dec_part = cipher.decrypt(session_key, 12, bytes(enc_part['cipher']))
+                    enc_ap_rep = decoder.decode(dec_part, asn1Spec=EncAPRepPart())[0]
+
+                    # Extract subkey if server provided one
+                    if enc_ap_rep['subkey'] and enc_ap_rep['subkey'].hasValue():
+                        subkey_type = int(enc_ap_rep['subkey']['keytype'])
+                        subkey_value = bytes(enc_ap_rep['subkey']['keyvalue'])
+                        enc_key = KerberosKey(subkey_type, subkey_value)
+            except Exception as e:
+                logging.warning('Could not process AP_REP for subkey: %s', e)
+
+        # Step 6: Set up Kerberos cipher for channel encryption
+        self._kerberos_cipher = KerberosCipher(cipher, enc_key)
         self._use_kerberos = True
         self._sequence = 0
-
-        logging.debug("Kerberos authentication successful")
