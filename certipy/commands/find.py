@@ -1028,14 +1028,13 @@ class Find:
                 )
                 logging.info(f"Wrote text output to {output_path!r}")
 
-        # Save BloodHound CE v6 JSON output (zip)
+        # Save BloodHound CE v6 JSON output
         if self.json or not_specified:
             from certipy.lib.bloodhound_ce import generate_bloodhound_output
 
-            zip_path = f"{prefix}_Certipy.zip"
             logging.info("Generating BloodHound CE v6 compatible output")
             generate_bloodhound_output(
-                templates, cas, oids, self.connection, prefix, zip_path
+                templates, cas, oids, self.connection, prefix
             )
 
         # Save CSV output
