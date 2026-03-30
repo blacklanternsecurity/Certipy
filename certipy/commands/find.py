@@ -1028,24 +1028,15 @@ class Find:
                 )
                 logging.info(f"Wrote text output to {output_path!r}")
 
-        # Save JSON output
+        # Save BloodHound CE v6 JSON output (zip)
         if self.json or not_specified:
-            output_path = f"{prefix}_Certipy.json"
-            logging.info(f"Saving JSON output to {output_path!r}")
+            from certipy.lib.bloodhound_ce import generate_bloodhound_output
 
-            f = io.StringIO()
-            json.dump(
-                output,
-                f,
-                indent=2,
-                default=str,
+            zip_path = f"{prefix}_Certipy.zip"
+            logging.info("Generating BloodHound CE v6 compatible output")
+            generate_bloodhound_output(
+                templates, cas, oids, self.connection, prefix, zip_path
             )
-
-            output_path = try_to_save_file(
-                f.getvalue(),
-                output_path,
-            )
-            logging.info(f"Wrote JSON output to {output_path!r}")
 
         # Save CSV output
         if self.csv:
@@ -1064,14 +1055,6 @@ class Find:
             logging.info(f"Saving CA CSV output to {ca_output_path!r}")
             ca_output_path = try_to_save_file(ca_output, ca_output_path)
             logging.info(f"Wrote CA CSV output to {ca_output_path!r}")
-
-        # Save BloodHound CE output (always generated)
-        from certipy.lib.bloodhound_ce import generate_bloodhound_output
-
-        logging.info("Generating BloodHound CE v6 compatible output")
-        generate_bloodhound_output(
-            templates, cas, oids, self.connection, prefix
-        )
 
     def get_output_for_text_and_json(
         self, templates: List[LDAPEntry], cas: List[LDAPEntry], oids: List[LDAPEntry]

@@ -749,21 +749,26 @@ def generate_bloodhound_output(
     oids: List[LDAPEntry],
     connection,
     prefix: str,
-) -> List[str]:
+    zip_path: str,
+) -> str:
     """
     Generate BloodHound CE v6 compatible JSON files and package them into a zip.
+
+    Individual JSON files are written temporarily and then packaged into the
+    zip archive. The temporary files are removed after packaging.
 
     Args:
         templates: List of certificate template LDAP entries
         cas: List of certificate authority LDAP entries
         oids: List of issuance policy LDAP entries
         connection: LDAP/ADWS connection for domain info
-        prefix: Output file prefix
+        prefix: Output file prefix (used for temporary JSON filenames)
+        zip_path: Path for the output zip file
 
     Returns:
-        List of output file paths created
+        Path to the created zip file
     """
-    output_files = []
+    tmp_files = []
 
     # Convert certificate templates
     if templates:
@@ -781,9 +786,9 @@ def generate_bloodhound_output(
         if bh_templates:
             path = f"{prefix}_certtemplates.json"
             _write_bh_json(bh_templates, "certtemplates", BH_METHODS_ADCS, path)
-            output_files.append(path)
+            tmp_files.append(path)
             logging.info(
-                f"Wrote {len(bh_templates)} certificate templates to {path!r}"
+                f"Converted {len(bh_templates)} certificate templates"
             )
 
     # Convert enterprise CAs
@@ -802,8 +807,8 @@ def generate_bloodhound_output(
         if bh_cas:
             path = f"{prefix}_enterprisecas.json"
             _write_bh_json(bh_cas, "enterprisecas", BH_METHODS_ADCS, path)
-            output_files.append(path)
-            logging.info(f"Wrote {len(bh_cas)} enterprise CAs to {path!r}")
+            tmp_files.append(path)
+            logging.info(f"Converted {len(bh_cas)} enterprise CAs")
 
     # Convert issuance policies
     if oids:
@@ -821,16 +826,18 @@ def generate_bloodhound_output(
         if bh_oids:
             path = f"{prefix}_issuancepolicies.json"
             _write_bh_json(bh_oids, "issuancepolicies", BH_METHODS_ISSUANCE, path)
-            output_files.append(path)
-            logging.info(f"Wrote {len(bh_oids)} issuance policies to {path!r}")
+            tmp_files.append(path)
+            logging.info(f"Converted {len(bh_oids)} issuance policies")
 
-    # Package all JSON files into a zip for easy upload
-    if output_files:
-        zip_path = f"{prefix}_Certipy_BloodHound.zip"
+    # Package all JSON files into a zip and clean up temp files
+    if tmp_files:
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for fpath in output_files:
+            for fpath in tmp_files:
                 zf.write(fpath, os.path.basename(fpath))
-        logging.info(f"Packaged BloodHound CE files into {zip_path!r}")
-        output_files.append(zip_path)
 
-    return output_files
+        for fpath in tmp_files:
+            os.remove(fpath)
+
+        logging.info(f"Wrote BloodHound CE zip to {zip_path!r}")
+
+    return zip_path
