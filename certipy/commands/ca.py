@@ -13,6 +13,7 @@ It serves as a comprehensive tool for CA administration and security assessment.
 
 import argparse
 import copy
+import struct
 import time
 from typing import Any, List, Optional, Union
 
@@ -307,6 +308,49 @@ class ICertRequestD2(ICertCustom):
 
 
 # =========================================================================
+# Enrollment Agent Rights Parsing
+# =========================================================================
+
+
+def _parse_enrollment_agent_rights(
+    ea_rights_bytes: bytes,
+) -> "List[EnrollmentAgentRestriction]":
+    """
+    Parse the binary EnrollmentAgentRights security descriptor from the CA registry.
+
+    The DACL contains ACCESS_ALLOWED_CALLBACK_ACE entries (type 0x09).
+    Each ACE's Sid field is the enrollment agent SID, and ApplicationData
+    encodes the target SIDs + template name (see EnrollmentAgentRestriction.from_ace_opaque).
+
+    Args:
+        ea_rights_bytes: Raw bytes of the EnrollmentAgentRights registry value
+
+    Returns:
+        List of EnrollmentAgentRestriction objects
+    """
+    from impacket.ldap import ldaptypes
+    from ldap3.protocol.formatters.formatters import format_sid
+
+    restrictions: List[EnrollmentAgentRestriction] = []
+
+    sd = ldaptypes.SR_SECURITY_DESCRIPTOR()
+    sd.fromString(ea_rights_bytes)
+
+    if sd["Dacl"] == b"":
+        return restrictions
+
+    for ace in sd["Dacl"]["Data"]:
+        if ace["AceType"] != ldaptypes.ACCESS_ALLOWED_CALLBACK_ACE.ACE_TYPE:
+            continue
+        agent_sid = format_sid(ace["Ace"]["Sid"].getData())
+        opaque: bytes = bytes(ace["Ace"]["ApplicationData"])
+        restriction = EnrollmentAgentRestriction.from_ace_opaque(agent_sid, opaque)
+        restrictions.append(restriction)
+
+    return restrictions
+
+
+# =========================================================================
 # Main CA Class
 # =========================================================================
 
@@ -335,6 +379,7 @@ class CA:
         dynamic: bool = False,
         config: Optional[str] = None,
         timeout: int = 5,
+        ace_type: str = "allow",
         **kwargs,  # type: ignore
     ):
         """
@@ -364,6 +409,7 @@ class CA:
         self.config = config
         self.timeout = timeout
         self.kwargs = kwargs
+        self.ace_type = ace_type
 
         # Initialize connection objects
         self._connection: Optional[LDAPConnection] = connection
@@ -646,6 +692,19 @@ class CA:
         # Parse the binary security descriptor
         security_descriptor = CASecurity(security_descriptor)
 
+        # Retrieve EnrollmentAgentRights (controls which agents can enroll on behalf of which targets)
+        enrollment_agent_restrictions: Optional[List[EnrollmentAgentRestriction]] = None
+        try:
+            _, ea_rights_bytes = rrp.hBaseRegQueryValue(
+                self.rrp_dce, configuration_key["phkResult"], "EnrollmentAgentRights"
+            )
+            if isinstance(ea_rights_bytes, bytes) and ea_rights_bytes:
+                enrollment_agent_restrictions = _parse_enrollment_agent_rights(
+                    ea_rights_bytes
+                )
+        except Exception:
+            pass
+
         # Return a complete configuration object
         return CAConfiguration(
             active_policy,
@@ -654,6 +713,7 @@ class CA:
             request_disposition,
             interface_flags,
             security_descriptor,
+            enrollment_agent_restrictions,
         )
 
     def get_config(self) -> Optional["CAConfiguration"]:
@@ -936,7 +996,12 @@ class CA:
     # =========================================================================
 
     def _modify_ca_security(
-        self, user: str, right: int, right_type: str, remove: bool = False
+        self,
+        user: str,
+        right: int,
+        right_type: str,
+        remove: bool = False,
+        ace_type: str = "allow",
     ) -> Union[bool, None]:
         """
         Add or remove rights for a user on the CA.
@@ -946,11 +1011,23 @@ class CA:
             right: Right to add/remove (from CERTIFICATION_AUTHORITY_RIGHTS)
             right_type: Description of the right (for logging)
             remove: If True, remove the right; otherwise add it
+            ace_type: 'allow' or 'deny'
 
         Returns:
             True if successful, False if failed, None if user not found
         """
+
         connection = self.connection
+
+        # Map ace_type to LDAP ACE_TYPE
+
+        if ace_type.lower() == "allow":
+            target_ace_type = ldaptypes.ACCESS_ALLOWED_ACE.ACE_TYPE
+        elif ace_type.lower() == "deny":
+            target_ace_type = ldaptypes.ACCESS_DENIED_ACE.ACE_TYPE
+        else:
+            logging.error(f"Invalid ace_type {ace_type!r}, must be 'allow' or 'deny'")
+            return False
 
         # Get user object
         user_obj = connection.get_user(user)
@@ -980,43 +1057,35 @@ class CA:
         sd = ldaptypes.SR_SECURITY_DESCRIPTOR()
         sd.fromString(b"".join(resp["pctbSD"]["pb"]))
 
+        ace_found = False
+
         # Find ACE for the user or create a new one
-        for i in range(len(sd["Dacl"]["Data"])):
-            ace = sd["Dacl"]["Data"][i]
-            if ace["AceType"] != ldaptypes.ACCESS_ALLOWED_ACE.ACE_TYPE:
+        for i, ace in enumerate(sd["Dacl"]["Data"]):
+            if ace["AceType"] != target_ace_type:
                 continue
 
             if ace["Ace"]["Sid"].getData() != sid.getData():
                 continue
 
-            # Found existing ACE for this user
-            action = "remove" if remove else "add"
+            ace_found = True
 
             if remove:
-                # Check if user has the right
                 if ace["Ace"]["Mask"]["Mask"] & right == 0:
                     logging.info(
                         f"User {user_obj.get('sAMAccountName')!r} does not have {right_type} "
-                        f"rights on {self.ca!r}"
+                        f"{ace_type} rights on {self.ca!r}"
                     )
                     return True
-
-                # Remove the right
                 ace["Ace"]["Mask"]["Mask"] ^= right
-
-                # Remove the ACE if no rights remaining
                 if ace["Ace"]["Mask"]["Mask"] == 0:
                     sd["Dacl"]["Data"].pop(i)
             else:
-                # Check if user already has the right
                 if ace["Ace"]["Mask"]["Mask"] & right != 0:
                     logging.info(
                         f"User {user_obj.get('sAMAccountName')!r} already has {right_type} "
-                        f"rights on {self.ca!r}"
+                        f"{ace_type} rights on {self.ca!r}"
                     )
                     return True
-
-                # Add the right
                 ace["Ace"]["Mask"]["Mask"] |= right
 
             break
@@ -1026,20 +1095,29 @@ class CA:
                 # Nothing to remove
                 logging.info(
                     f"User {user_obj.get('sAMAccountName')!r} does not have {right_type} "
-                    f"rights on {self.ca!r}"
+                    f"{ace_type} rights on {self.ca!r}"
                 )
                 return True
 
-            # Create new ACE
+        # Create new ACE if none found and we're adding rights
+        if not ace_found and not remove:
             ace = ldaptypes.ACE()
-            ace["AceType"] = ldaptypes.ACCESS_ALLOWED_ACE.ACE_TYPE
+            ace["AceType"] = target_ace_type
             ace["AceFlags"] = 0
-            ace["Ace"] = ldaptypes.ACCESS_ALLOWED_ACE()
+            ace["Ace"] = (
+                ldaptypes.ACCESS_ALLOWED_ACE()
+                if target_ace_type == ldaptypes.ACCESS_ALLOWED_ACE.ACE_TYPE
+                else ldaptypes.ACCESS_DENIED_ACE()
+            )
             ace["Ace"]["Mask"] = ldaptypes.ACCESS_MASK()
             ace["Ace"]["Mask"]["Mask"] = right
             ace["Ace"]["Sid"] = sid
 
-            sd["Dacl"]["Data"].append(ace)
+            # Insert deny ACEs at the top, allow ACEs at the bottom
+            if target_ace_type == ldaptypes.ACCESS_DENIED_ACE.ACE_TYPE:
+                sd["Dacl"]["Data"].insert(0, ace)
+            else:
+                sd["Dacl"]["Data"].append(ace)
 
         # Convert SD back to bytes
         sd_bytes = [bytes([c]) for c in sd.getData()]
@@ -1089,7 +1167,9 @@ class CA:
         Returns:
             True if successful, False if failed, None if user not found
         """
-        return self._modify_ca_security(user, right, right_type, remove=False)
+        return self._modify_ca_security(
+            user, right, right_type, ace_type=self.ace_type, remove=False
+        )
 
     def remove(self, user: str, right: int, right_type: str) -> Union[bool, None]:
         """
@@ -1103,7 +1183,9 @@ class CA:
         Returns:
             True if successful, False if failed, None if user not found
         """
-        return self._modify_ca_security(user, right, right_type, remove=True)
+        return self._modify_ca_security(
+            user, right, right_type, ace_type=self.ace_type, remove=True
+        )
 
     def add_officer(self, officer: str) -> Union[bool, None]:
         """
@@ -1443,6 +1525,83 @@ class CA:
         return True
 
 
+class EnrollmentAgentRestriction:
+    """
+    Represents a single Enrollment Agent restriction ACE from the CA's EnrollmentAgentRights.
+
+    Each ACE encodes:
+    - agent: SID of the enrollment agent (who holds the EA certificate)
+    - targets: list of SIDs that the agent is allowed to enroll on behalf of
+    - template: certificate template name the restriction applies to (or '<All>')
+    """
+
+    def __init__(self, agent_sid: str, targets: List[str], template: str):
+        self.agent = agent_sid
+        self.targets = targets
+        self.template = template
+
+    @classmethod
+    def from_ace_opaque(
+        cls, agent_sid: str, opaque: bytes
+    ) -> "EnrollmentAgentRestriction":
+        """
+        Parse the opaque blob embedded in an EnrollmentAgentRights ACE.
+
+        Binary layout (matches MS-WCCE / Certify's EnrollmentAgentRestriction.cs):
+          [4 bytes LE uint32] sid_count
+          [sid_count * variable] binary SIDs
+          [remaining bytes - 2] UTF-16LE template name (null-terminated, strip trailing NUL)
+        """
+        targets: List[str] = []
+        index = 0
+
+        if len(opaque) < 4:
+            return cls(agent_sid, targets, "<All>")
+
+        sid_count = struct.unpack_from("<I", opaque, index)[0]
+        index += 4
+
+        for _ in range(sid_count):
+            if index >= len(opaque):
+                break
+            sid_len = cls._sid_binary_length(opaque, index)
+            if sid_len <= 0 or index + sid_len > len(opaque):
+                break
+            sid_str = cls._parse_sid(opaque, index)
+            targets.append(sid_str)
+            index += sid_len
+
+        if index < len(opaque) - 2:
+            raw = opaque[index : len(opaque) - 2]
+            template = raw.decode("utf-16-le", errors="replace").rstrip("\x00")
+        else:
+            template = "<All>"
+
+        return cls(agent_sid, targets, template)
+
+    @staticmethod
+    def _sid_binary_length(data: bytes, offset: int) -> int:
+        """Return the byte length of a binary SID starting at offset."""
+        if offset + 2 > len(data):
+            return -1
+        sub_authority_count = data[offset + 1]
+        return 8 + 4 * sub_authority_count
+
+    @staticmethod
+    def _parse_sid(data: bytes, offset: int) -> str:
+        """Parse a binary SID from data at offset and return its string form."""
+        revision = data[offset]
+        sub_count = data[offset + 1]
+        authority = int.from_bytes(data[offset + 2 : offset + 8], "big")
+        subs = struct.unpack_from(f"<{sub_count}I", data, offset + 8)
+        sub_str = "-".join(str(s) for s in subs)
+        return (
+            f"S-{revision}-{authority}-{sub_str}"
+            if sub_str
+            else f"S-{revision}-{authority}"
+        )
+
+
 class CAConfiguration:
     """
     Class representing a Certificate Authority configuration.
@@ -1457,6 +1616,7 @@ class CAConfiguration:
         request_disposition: Default disposition for certificate requests
         interface_flags: Flags controlling CA interface behavior
         security: Security descriptor for the CA
+        enrollment_agent_restrictions: Parsed EnrollmentAgentRights restrictions (may be None)
     """
 
     def __init__(
@@ -1467,6 +1627,9 @@ class CAConfiguration:
         request_disposition: int,
         interface_flags: int,
         security: CASecurity,
+        enrollment_agent_restrictions: Optional[
+            List[EnrollmentAgentRestriction]
+        ] = None,
     ):
         """
         Initialize a CA configuration object.
@@ -1478,6 +1641,7 @@ class CAConfiguration:
             request_disposition: Default disposition for new certificate requests
             interface_flags: Interface control flags
             security: CASecurity object containing the CA's security descriptor
+            enrollment_agent_restrictions: Parsed list of EnrollmentAgentRestriction objects
         """
         self.active_policy = active_policy
         self.edit_flags = edit_flags
@@ -1485,6 +1649,7 @@ class CAConfiguration:
         self.request_disposition = request_disposition
         self.interface_flags = interface_flags
         self.security = security
+        self.enrollment_agent_restrictions = enrollment_agent_restrictions
 
 
 def entry(options: argparse.Namespace) -> None:

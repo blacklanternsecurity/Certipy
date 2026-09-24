@@ -6,7 +6,7 @@ This module allows enumerating Active Directory Certificate Services (AD CS) com
 - Certificate authorities
 - Certificate issuance policies
 - Security permissions and ACLs
-- Vulnerability detection for ESC1-15
+- Vulnerability detection for ESC1-17
 
 It provides detailed information about certificate templates, authorities, and security
 settings, helping identify misconfiguration and potential attack vectors.
@@ -524,6 +524,7 @@ class Find:
             enforce_encrypt_icertrequest = "Unknown"
             disabled_extensions = "Unknown"
             security = None
+            enrollment_agent_restrictions = None
 
             if ca_configuration is not None:
                 active_policy = ca_configuration.active_policy
@@ -554,6 +555,10 @@ class Find:
 
                 security = ca_configuration.security
 
+                enrollment_agent_restrictions = (
+                    ca_configuration.enrollment_agent_restrictions
+                )
+
             # Update properties
             ca_properties.update(
                 {
@@ -563,6 +568,7 @@ class Find:
                     "enforce_encrypt_icertrequest": enforce_encrypt_icertrequest,
                     "disabled_extensions": disabled_extensions,
                     "security": security,
+                    "enrollment_agent_restrictions": enrollment_agent_restrictions,
                 }
             )
 
@@ -946,6 +952,12 @@ class Find:
         )
         template.set("client_authentication", client_authentication)
 
+        # Check for server authentication capability
+        server_authentication = (
+            "Server Authentication" in extended_key_usage or any_purpose
+        )
+        template.set("server_authentication", server_authentication)
+
         # Check for enrollment agent capability
         enrollment_agent = (
             any_purpose or "Certificate Request Agent" in extended_key_usage
@@ -1081,7 +1093,7 @@ class Find:
                 continue
 
             # Get template vulnerabilities
-            (vulnerabilities, remarks, enrollable_principals, acl_principals) = (
+            vulnerabilities, remarks, enrollable_principals, acl_principals = (
                 self.get_template_vulnerabilities(template)
             )
 
@@ -1122,13 +1134,31 @@ class Find:
             entry = OrderedDict()
             entry = self.get_ca_properties(ca, entry)
 
+            # Add Enrollment Agent Restrictions if present
+            ea_restrictions = ca.get("enrollment_agent_restrictions")
+            if ea_restrictions is not None:
+                restrictions_output = OrderedDict()
+                for restriction in ea_restrictions:
+                    agent_name = self.connection.lookup_sid(restriction.agent).get(
+                        "name"
+                    )
+                    target_names = [
+                        self.connection.lookup_sid(t).get("name")
+                        for t in restriction.targets
+                    ]
+                    restrictions_output[agent_name] = {
+                        "Template": restriction.template,
+                        "Targets": target_names if target_names else ["<All>"],
+                    }
+                entry["Enrollment Agent Restrictions"] = restrictions_output
+
             # Add permissions
             permissions = self.get_ca_permissions(ca)
             if permissions:
                 entry["Permissions"] = permissions
 
             # Add vulnerabilities
-            (vulnerabilities, remarks, enrollable_principals, acl_principals) = (
+            vulnerabilities, remarks, enrollable_principals, acl_principals = (
                 self.get_ca_vulnerabilities(ca)
             )
 
@@ -1155,7 +1185,7 @@ class Find:
         if self.oids:
             for oid in oids:
                 # Get OID vulnerabilities
-                (vulnerabilities, acl_principals) = self.get_oid_vulnerabilities(oid)
+                vulnerabilities, acl_principals = self.get_oid_vulnerabilities(oid)
 
                 # Skip if only showing vulnerable OIDs and this one isn't
                 if self.vuln and not vulnerabilities:
@@ -1881,6 +1911,7 @@ class Find:
         - ESC9: Template with no security extension
         - ESC13: Template linked to a group through issuance policy
         - ESC15: Schema v1 template with enrollee-supplied subject (CVE-2024-49019)
+        - ESC17: Server authentication template with enrollee-supplied subject
 
         Args:
             template: Certificate template to analyze
@@ -1971,6 +2002,19 @@ class Find:
                     remarks["ESC15"] = (
                         f"Only applicable if the environment has not been patched. "
                         "See CVE-2024-49019 or the wiki for more details."
+                    )
+
+                # ESC17: Server authentication with enrollee-supplied subject
+                if template.get("enrollee_supplies_subject") and template.get(
+                    "server_authentication"
+                ):
+                    vulnerabilities["ESC17"] = (
+                        f"Enrollee supplies subject "
+                        "and template allows server authentication."
+                    )
+                    remarks["ESC17"] = (
+                        "Other prerequisites may be required for this to be exploitable. See "
+                        "the wiki for more details."
                     )
 
             # ESC2 Target: Schema v1 or requires Any Purpose signature
