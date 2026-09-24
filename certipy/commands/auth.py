@@ -780,11 +780,7 @@ class Authenticate:
 
                 # Set KDC options for U2U
                 opts = [
-                    e2i(constants.KDCOptions.forwardable),
-                    e2i(constants.KDCOptions.renewable),
-                    e2i(constants.KDCOptions.canonicalize),
-                    e2i(constants.KDCOptions.enc_tkt_in_skey),  # This enables U2U
-                    e2i(constants.KDCOptions.forwardable),
+                    e2i(constants.KDCOptions.enc_tkt_in_skey),  # Required for U2U
                     e2i(constants.KDCOptions.renewable_ok),
                 ]
                 req_body["kdc-options"] = constants.encodeFlags(opts)
