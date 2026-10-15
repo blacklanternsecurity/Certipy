@@ -15,8 +15,10 @@ References:
 
 import datetime
 import os
+import random
+import string
 from random import getrandbits
-from typing import Dict, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 from asn1crypto import algos as asn1algos
 from asn1crypto import cms as asn1cms
@@ -36,9 +38,13 @@ from certipy.lib.structs import (
     AsReq,
     AuthPack,
     EncType,
+    HostAddress,
+    HostAddresses,
     KDCOptions,
     KdcReqBody,
     NameType,
+    OldAuthPack,
+    OldPKAuthenticator,
     PaPacRequest,
     PaPkAsReq,
     PKAuthenticator,
@@ -69,6 +75,17 @@ DH_PARAMS = {
 PKINIT_OID = "1.3.6.1.5.2.3.1"
 CMS_SIGNED_DATA_OID = "1.2.840.113549.1.7.2"
 DH_KEY_AGREEMENT_OID = "1.2.840.10046.2.1"
+
+# Old PKINIT PA-DATA type (Windows uses 15 for the old format request, not 14)
+PA_PK_AS_REQ_OLD = 15
+PA_PK_OCSP_RESPONSE = 18
+PA_PK_AS_09_BINDING = 132
+
+# Windows-matching etype list for PKINIT AS-REQ
+WINDOWS_PKINIT_ETYPES = [12, 15, 18, 17, 23, 24, -135, 3]
+
+# NetBIOS address type
+ADDRTYPE_NETBIOS = 20
 
 
 # =========================================================================
@@ -150,6 +167,7 @@ def sign_authpack(
     data: bytes,
     key: rsa.RSAPrivateKey,
     cert: Union[x509.Certificate, asn1x509.Certificate],
+    native: bool = False,
 ) -> bytes:
     """
     Create a signed CMS structure containing the AuthPack.
@@ -158,6 +176,7 @@ def sign_authpack(
         data: The AuthPack data to sign
         key: RSA private key for signing
         cert: Certificate to include in the signed data
+        native: If True, use rsaEncryption OID (Windows native format)
 
     Returns:
         ASN.1 DER encoded CMS signed data
@@ -186,7 +205,7 @@ def sign_authpack(
             ),
         ],
         "signature_algorithm": asn1algos.SignedDigestAlgorithm(
-            {"algorithm": "sha1_rsa"}
+            {"algorithm": "rsassa_pkcs1v15" if native else "sha1_rsa"}
         ),
         "signature": bytes(),
     }
@@ -334,3 +353,122 @@ def build_pkinit_as_req(
 
     # Return the encoded AS-REQ and the Diffie-Hellman object
     return AsReq(asreq).dump(), diffie
+
+
+def build_pkinit_as_req_native(
+    username: str,
+    domain: str,
+    key: rsa.RSAPrivateKey,
+    cert: x509.Certificate,
+    upn: Optional[str] = None,
+    hostname: Optional[str] = None,
+) -> bytes:
+    """
+    Build a PKINIT AS-REQ matching the Windows native wire format.
+
+    Uses the old MS-PKCA format (PA type 15, RSA key transport) instead of
+    RFC 4556 (PA type 16, Diffie-Hellman) to match the Windows PKINIT
+    fingerprint.
+
+    Args:
+        username: Client username
+        domain: Domain/realm name
+        key: RSA private key for signing
+        cert: Client certificate
+        upn: User Principal Name (default: username@domain)
+        hostname: NetBIOS hostname for address field (auto-generated if None)
+
+    Returns:
+        The encoded AS-REQ message bytes
+    """
+    if upn is None:
+        upn = f"{username}@{domain.lower()}"
+
+    if hostname is None:
+        hostname = "DESKTOP-" + "".join(
+            random.choices(string.ascii_uppercase + string.digits, k=7)
+        )
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    # NetBIOS address: 15-char hostname padded with spaces + 0x20 suffix byte
+    netbios_name = hostname.upper()[:15].ljust(15).encode("ascii") + b"\x20"
+
+    # Build KDC-REQ-BODY matching Windows native format
+    kdc_req_body_data = {
+        "kdc-options": KDCOptions(
+            {"forwardable", "renewable", "canonicalize", "renewable-ok"}
+        ),
+        "cname": PrincipalName(
+            {"name-type": NameType.ENTERPRISE_PRINCIPAL, "name-string": [upn]}
+        ),
+        "realm": domain.upper(),
+        "sname": PrincipalName(
+            {
+                "name-type": NameType.SRV_INST,
+                "name-string": ["krbtgt", domain.upper()],
+            }
+        ),
+        "till": (now + datetime.timedelta(days=3652)).replace(microsecond=0),
+        "rtime": (now + datetime.timedelta(days=3652)).replace(microsecond=0),
+        "nonce": getrandbits(31),
+        "etype": WINDOWS_PKINIT_ETYPES,
+        "addresses": HostAddresses(
+            [HostAddress({"addr-type": ADDRTYPE_NETBIOS, "address": netbios_name})]
+        ),
+    }
+
+    kdc_req_body = KdcReqBody(kdc_req_body_data)
+
+    # Build old-format PKAuthenticator (draft-9: kdcName/kdcRealm, no paChecksum)
+    authenticator = OldPKAuthenticator(
+        {
+            "kdcName": PrincipalName(
+                {
+                    "name-type": NameType.SRV_INST,
+                    "name-string": ["krbtgt", domain.upper()],
+                }
+            ),
+            "kdcRealm": domain.upper(),
+            "cusec": now.microsecond,
+            "ctime": now.replace(microsecond=0),
+            "nonce": getrandbits(31),
+        }
+    )
+
+    # Old AuthPack: only pkAuthenticator, no DH fields
+    authpack = OldAuthPack({"pkAuthenticator": authenticator})
+
+    # Sign with rsaEncryption OID (native=True)
+    signed_authpack = sign_authpack(authpack.dump(), key, cert, native=True)
+
+    # PA-PK-AS-REQ (old format, type 15)
+    pa_pk_as_req = PaPkAsReq()
+    pa_pk_as_req["signedAuthPack"] = signed_authpack
+
+    # PA-DATA items in Windows order
+    pa_data_pk = {
+        "padata-type": PA_PK_AS_REQ_OLD,
+        "padata-value": pa_pk_as_req.dump(),
+    }
+    pa_data_ocsp = {
+        "padata-type": PA_PK_OCSP_RESPONSE,
+        "padata-value": b"",
+    }
+    pa_data_binding = {
+        "padata-type": PA_PK_AS_09_BINDING,
+        "padata-value": b"",
+    }
+    pa_data_pac = {
+        "padata-type": e2i(constants.PreAuthenticationDataTypes.PA_PAC_REQUEST),
+        "padata-value": PaPacRequest({"include-pac": True}).dump(),
+    }
+
+    asreq = {
+        "pvno": 5,
+        "msg-type": 10,
+        "padata": [pa_data_pk, pa_data_ocsp, pa_data_binding, pa_data_pac],
+        "req-body": kdc_req_body,
+    }
+
+    return AsReq(asreq).dump()

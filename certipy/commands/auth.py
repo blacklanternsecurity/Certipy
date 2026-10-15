@@ -18,8 +18,9 @@ from random import getrandbits
 from typing import Any, Optional, Union
 
 from asn1crypto import cms, core
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from impacket.dcerpc.v5.rpcrt import TypeSerialization1
 from impacket.examples.ldap_shell import LdapShell as _LdapShell
 from impacket.krb5 import constants
@@ -66,8 +67,8 @@ from certipy.lib.errors import KRB5_ERROR_MESSAGES, handle_error
 from certipy.lib.files import try_to_save_file
 from certipy.lib.ldap import LDAPConnection
 from certipy.lib.logger import logging
-from certipy.lib.pkinit import build_pkinit_as_req
-from certipy.lib.structs import EncType, KDCDHKeyInfo, PaPkAsRep, e2i
+from certipy.lib.pkinit import build_pkinit_as_req, build_pkinit_as_req_native
+from certipy.lib.structs import EncType, KDCDHKeyInfo, PaPkAsRep, ReplyKeyPack, e2i
 from certipy.lib.target import Target
 
 
@@ -193,6 +194,8 @@ class Authenticate:
         print: bool = False,
         kirbi: bool = False,
         ldap_shell: bool = False,
+        native_pkinit: bool = False,
+        hostname: Optional[str] = None,
         **kwargs,  # type: ignore
     ):
         """
@@ -229,6 +232,8 @@ class Authenticate:
         self.print = print
         self.kirbi = kirbi
         self.ldap_shell = ldap_shell
+        self.native_pkinit = native_pkinit
+        self.hostname = hostname
         self.kwargs = kwargs
 
         # These will be populated during authentication
@@ -545,6 +550,44 @@ class Authenticate:
 
         return True
 
+    @staticmethod
+    def _decrypt_enveloped_data(
+        enc_key_pack_bytes: bytes, private_key: rsa.RSAPrivateKey
+    ) -> bytes:
+        """Decrypt CMS EnvelopedData from old PKINIT reply (RSA key transport)."""
+        ci = cms.ContentInfo.load(enc_key_pack_bytes)
+        enveloped_data = ci["content"]
+
+        recipient_info = enveloped_data["recipient_infos"][0].chosen
+        encrypted_key = recipient_info["encrypted_key"].native
+
+        cek = private_key.decrypt(encrypted_key, padding.PKCS1v15())
+
+        eci = enveloped_data["encrypted_content_info"]
+        algo = eci["content_encryption_algorithm"]
+        algo_name = algo["algorithm"].native
+        encrypted_content = eci["encrypted_content"].native
+
+        iv = algo.encryption_iv
+
+        if "tripledes" in algo_name or "des_ede3" in algo_name:
+            cipher_obj = Cipher(algorithms.TripleDES(cek), modes.CBC(iv))
+        elif "aes" in algo_name:
+            cipher_obj = Cipher(algorithms.AES(cek), modes.CBC(iv))
+        else:
+            raise ValueError(
+                f"Unsupported content encryption algorithm: {algo_name}"
+            )
+
+        decryptor = cipher_obj.decryptor()
+        decrypted = decryptor.update(encrypted_content) + decryptor.finalize()
+
+        pad_len = decrypted[-1]
+        if 0 < pad_len <= 16:
+            decrypted = decrypted[:-pad_len]
+
+        return decrypted
+
     def kerberos_authentication(
         self,
         username: str,
@@ -582,7 +625,18 @@ class Authenticate:
             )
 
         # Create AS-REQ for PKINIT
-        as_req, diffie = build_pkinit_as_req(username, domain, self.key, self.cert)
+        if self.native_pkinit:
+            as_req = build_pkinit_as_req_native(
+                username, domain, self.key, self.cert,
+                upn=upn, hostname=self.hostname,
+            )
+            logging.info(
+                "Using native PKINIT format (PA type 15, RSA key transport)"
+            )
+        else:
+            as_req, diffie = build_pkinit_as_req(
+                username, domain, self.key, self.cert
+            )
 
         # Resolve target IP if needed
         if self.target and self.target.resolver and self.target.target_ip is None:
@@ -644,58 +698,88 @@ class Authenticate:
         # Process AS-REP
         as_rep = decoder.decode(tgt, asn1Spec=AS_REP())[0]
 
-        # Extract PA-PK-AS-REP
-        for pa in as_rep["padata"]:
-            if pa["padata-type"] == 17:  # PA-PK-AS-REP
-                pk_as_rep = PaPkAsRep.load(bytes(pa["padata-value"])).native
-                break
+        if self.native_pkinit:
+            # RSA key transport reply (PA type 15)
+            for pa in as_rep["padata"]:
+                if pa["padata-type"] == 15:  # PA-PK-AS-REP old
+                    pk_as_rep = PaPkAsRep.load(bytes(pa["padata-value"]))
+                    break
+            else:
+                logging.error("PA_PK_AS_REP (type 15) was not found in AS_REP")
+                return False
+
+            enc_key_pack = pk_as_rep.native
+            decrypted = self._decrypt_enveloped_data(enc_key_pack, self.key)
+
+            signed_data = cms.SignedData.load(decrypted)
+            reply_key_pack_bytes = (
+                signed_data["encap_content_info"]["content"].native
+            )
+            reply_key_pack = ReplyKeyPack.load(reply_key_pack_bytes)
+
+            reply_etype = reply_key_pack["replyKey"]["keytype"].native
+            t_key = reply_key_pack["replyKey"]["keyvalue"].native
+
+            cipher = _enctype_table[reply_etype]
+            key = Key(cipher.enctype, t_key)
+
+            enc_data = as_rep["enc-part"]["cipher"]
+            dec_data = cipher.decrypt(key, 3, enc_data)
+            enc_as_rep_part = decoder.decode(dec_data, asn1Spec=EncASRepPart())[0]
+
+            cipher = _enctype_table[int(enc_as_rep_part["key"]["keytype"])]
+            session_key = Key(
+                cipher.enctype, bytes(enc_as_rep_part["key"]["keyvalue"])
+            )
         else:
-            logging.error("PA_PK_AS_REP was not found in AS_REP")
-            return False
+            # DH key exchange reply (PA type 17)
+            for pa in as_rep["padata"]:
+                if pa["padata-type"] == 17:  # PA-PK-AS-REP
+                    pk_as_rep = PaPkAsRep.load(bytes(pa["padata-value"])).native
+                    break
+            else:
+                logging.error("PA_PK_AS_REP was not found in AS_REP")
+                return False
 
-        # Process Diffie-Hellman key exchange data
-        ci = cms.ContentInfo.load(pk_as_rep["dhSignedData"]).native
-        sd = ci["content"]
-        key_info = sd["encap_content_info"]
+            ci = cms.ContentInfo.load(pk_as_rep["dhSignedData"]).native
+            sd = ci["content"]
+            key_info = sd["encap_content_info"]
 
-        if key_info["content_type"] != "1.3.6.1.5.2.3.2":
-            logging.error("Unexpected value for key info content type")
-            return False
+            if key_info["content_type"] != "1.3.6.1.5.2.3.2":
+                logging.error("Unexpected value for key info content type")
+                return False
 
-        # Get public key from KDC
-        auth_data = KDCDHKeyInfo.load(key_info["content"]).native
-        pub_key = int.from_bytes(
-            core.BitString(auth_data["subjectPublicKey"]).dump()[7:],
-            "big",
-            signed=False,
-        )
+            auth_data = KDCDHKeyInfo.load(key_info["content"]).native
+            pub_key = int.from_bytes(
+                core.BitString(auth_data["subjectPublicKey"]).dump()[7:],
+                "big",
+                signed=False,
+            )
 
-        # Complete Diffie-Hellman exchange
-        shared_key = diffie.exchange(pub_key)
-        server_nonce = pk_as_rep["serverDHNonce"]
-        full_key = shared_key + diffie.dh_nonce + server_nonce
+            shared_key = diffie.exchange(pub_key)
+            server_nonce = pk_as_rep["serverDHNonce"]
+            full_key = shared_key + diffie.dh_nonce + server_nonce
 
-        # Derive encryption key
-        etype = as_rep["enc-part"]["etype"]
-        cipher = _enctype_table[etype]
+            etype = as_rep["enc-part"]["etype"]
+            cipher = _enctype_table[etype]
 
-        if etype == EncType.AES256:
-            t_key = truncate_key(full_key, 32)
-        elif etype == EncType.AES128:
-            t_key = truncate_key(full_key, 16)
-        else:
-            logging.error("Unexpected encryption type in AS_REP")
-            return False
+            if etype == EncType.AES256:
+                t_key = truncate_key(full_key, 32)
+            elif etype == EncType.AES128:
+                t_key = truncate_key(full_key, 16)
+            else:
+                logging.error("Unexpected encryption type in AS_REP")
+                return False
 
-        # Decrypt AS-REP
-        key = Key(cipher.enctype, t_key)
-        enc_data = as_rep["enc-part"]["cipher"]
-        dec_data = cipher.decrypt(key, 3, enc_data)
-        enc_as_rep_part = decoder.decode(dec_data, asn1Spec=EncASRepPart())[0]
+            key = Key(cipher.enctype, t_key)
+            enc_data = as_rep["enc-part"]["cipher"]
+            dec_data = cipher.decrypt(key, 3, enc_data)
+            enc_as_rep_part = decoder.decode(dec_data, asn1Spec=EncASRepPart())[0]
 
-        # Extract session key
-        cipher = _enctype_table[int(enc_as_rep_part["key"]["keytype"])]
-        session_key = Key(cipher.enctype, bytes(enc_as_rep_part["key"]["keyvalue"]))
+            cipher = _enctype_table[int(enc_as_rep_part["key"]["keytype"])]
+            session_key = Key(
+                cipher.enctype, bytes(enc_as_rep_part["key"]["keyvalue"])
+            )
 
         # Create credential cache
         ccache = CCache()

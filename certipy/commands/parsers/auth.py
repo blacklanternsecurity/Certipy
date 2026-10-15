@@ -136,6 +136,17 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> Tuple[str, Callable
         action="store_true",
         help="Authenticate with the certificate via Schannel against LDAP",
     )
+    auth_group.add_argument(
+        "-native-pkinit",
+        action="store_true",
+        help="Use Windows-native PKINIT format (PA type 15, RSA key transport) to evade detection",
+    )
+    auth_group.add_argument(
+        "-hostname",
+        action="store",
+        metavar="hostname",
+        help="NetBIOS hostname for native PKINIT (auto-generated if omitted)",
+    )
 
     # LDAP Options Group
     ldap_group = subparser.add_argument_group("ldap options")

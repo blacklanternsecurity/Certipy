@@ -469,6 +469,49 @@ class AuthPack(core.Sequence):
 
 
 # =========================================================================
+# Old PKINIT (MS-PKCA draft-9) ASN.1 structures
+# =========================================================================
+
+
+class OldPKAuthenticator(core.Sequence):
+    """Draft-9 PKINIT authenticator (different tag layout from RFC 4556)."""
+
+    _fields = [
+        ("kdcName", PrincipalName, {"tag_type": "explicit", "tag": 0}),
+        ("kdcRealm", core.GeneralString, {"tag_type": "explicit", "tag": 1}),
+        ("cusec", core.Integer, {"tag_type": "explicit", "tag": 2}),
+        ("ctime", core.GeneralizedTime, {"tag_type": "explicit", "tag": 3}),
+        ("nonce", core.Integer, {"tag_type": "explicit", "tag": 4}),
+    ]
+
+
+class OldAuthPack(core.Sequence):
+    """Draft-9 PKINIT authentication pack (no DH fields)."""
+
+    _fields = [
+        ("pkAuthenticator", OldPKAuthenticator, {"tag_type": "explicit", "tag": 0}),
+    ]
+
+
+class EncryptionKey(core.Sequence):
+    """Kerberos EncryptionKey structure."""
+
+    _fields = [
+        ("keytype", core.Integer, {"tag_type": "explicit", "tag": 0}),
+        ("keyvalue", core.OctetString, {"tag_type": "explicit", "tag": 1}),
+    ]
+
+
+class ReplyKeyPack(core.Sequence):
+    """Old PKINIT ReplyKeyPack for RSA key transport reply."""
+
+    _fields = [
+        ("replyKey", EncryptionKey, {"tag_type": "explicit", "tag": 0}),
+        ("nonce", core.Integer, {"tag_type": "explicit", "tag": 1}),
+    ]
+
+
+# =========================================================================
 # ASN.1 structures for Microsoft certificate operations
 # =========================================================================
 
