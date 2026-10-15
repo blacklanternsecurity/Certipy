@@ -583,7 +583,11 @@ class Authenticate:
         decrypted = decryptor.update(encrypted_content) + decryptor.finalize()
 
         pad_len = decrypted[-1]
-        if 0 < pad_len <= 16:
+        if (
+            0 < pad_len <= 16
+            and len(decrypted) >= pad_len
+            and all(b == pad_len for b in decrypted[-pad_len:])
+        ):
             decrypted = decrypted[:-pad_len]
 
         return decrypted
@@ -711,11 +715,39 @@ class Authenticate:
             enc_key_pack = pk_as_rep.native
             decrypted = self._decrypt_enveloped_data(enc_key_pack, self.key)
 
-            signed_data = cms.SignedData.load(decrypted)
-            reply_key_pack_bytes = (
-                signed_data["encap_content_info"]["content"].native
-            )
-            reply_key_pack = ReplyKeyPack.load(reply_key_pack_bytes)
+            # The decrypted content format depends on the KDC:
+            # - OCTET STRING (0x04) wrapping SignedData → unwrap first
+            # - Raw SignedData SEQUENCE (0x30) → parse directly
+            # - ContentInfo wrapping SignedData → unwrap ContentInfo
+            inner = decrypted
+            if inner[0] == 0x04:
+                inner = core.OctetString.load(inner).native
+
+            reply_key_pack = None
+            for parser in [
+                lambda d: ReplyKeyPack.load(
+                    cms.SignedData.load(d)[
+                        "encap_content_info"
+                    ]["content"].native
+                ),
+                lambda d: ReplyKeyPack.load(
+                    cms.ContentInfo.load(d)["content"][
+                        "encap_content_info"
+                    ]["content"].native
+                ),
+                lambda d: ReplyKeyPack.load(d),
+            ]:
+                try:
+                    reply_key_pack = parser(inner)
+                    break
+                except Exception:
+                    continue
+
+            if reply_key_pack is None:
+                logging.error(
+                    "Failed to parse ReplyKeyPack from decrypted reply"
+                )
+                return False
 
             reply_etype = reply_key_pack["replyKey"]["keytype"].native
             t_key = reply_key_pack["replyKey"]["keyvalue"].native
