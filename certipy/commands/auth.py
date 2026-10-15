@@ -734,28 +734,39 @@ class Authenticate:
                 enc_key_pack, self.key
             )
 
-            # The decrypted content format depends on the KDC:
-            # - OCTET STRING (0x04) wrapping content → unwrap first
-            # - Raw SignedData SEQUENCE (0x30) → parse directly
-            # - ContentInfo wrapping SignedData → unwrap ContentInfo
-            # - Raw ReplyKeyPack → parse directly
+            # The decrypted content format varies by KDC:
+            # - OID (0x06) first: unwrapped ContentInfo fields — re-wrap
+            # - OCTET STRING (0x04): data-wrapped content — unwrap
+            # - SEQUENCE (0x30): SignedData or ContentInfo directly
             inner = decrypted
+
+            if inner[0] == 0x06:
+                # ContentInfo fields without SEQUENCE wrapper — re-wrap
+                length = len(inner)
+                if length < 0x80:
+                    header = bytes([0x30, length])
+                elif length < 0x100:
+                    header = bytes([0x30, 0x81, length])
+                else:
+                    header = bytes([0x30, 0x82, length >> 8, length & 0xFF])
+                inner = header + inner
+                logging.debug("Re-wrapped ContentInfo fields in SEQUENCE")
+
             if inner[0] == 0x04:
                 inner = core.OctetString.load(inner).native
                 logging.debug(
-                    f"Unwrapped OCTET STRING, inner first 32: "
-                    f"{inner[:32].hex()}"
+                    f"Unwrapped OCTET STRING, inner tag: 0x{inner[0]:02x}"
                 )
 
             reply_key_pack = None
             strategies = [
-                ("SignedData", lambda d: ReplyKeyPack.load(
-                    cms.SignedData.load(d)[
+                ("ContentInfo>SignedData", lambda d: ReplyKeyPack.load(
+                    cms.ContentInfo.load(d)["content"][
                         "encap_content_info"
                     ]["content"].native
                 )),
-                ("ContentInfo>SignedData", lambda d: ReplyKeyPack.load(
-                    cms.ContentInfo.load(d)["content"][
+                ("SignedData", lambda d: ReplyKeyPack.load(
+                    cms.SignedData.load(d)[
                         "encap_content_info"
                     ]["content"].native
                 )),
@@ -774,7 +785,8 @@ class Authenticate:
                 logging.error(
                     "Failed to parse ReplyKeyPack from decrypted reply. "
                     f"contentType={content_type}, "
-                    f"decrypted[0:32]={decrypted[:32].hex()}"
+                    f"tag=0x{decrypted[0]:02x}, "
+                    f"decrypted[0:48]={decrypted[:48].hex()}"
                 )
                 return False
 
