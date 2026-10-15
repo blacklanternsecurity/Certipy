@@ -553,8 +553,11 @@ class Authenticate:
     @staticmethod
     def _decrypt_enveloped_data(
         enc_key_pack_bytes: bytes, private_key: rsa.RSAPrivateKey
-    ) -> bytes:
-        """Decrypt CMS EnvelopedData from old PKINIT reply (RSA key transport)."""
+    ) -> tuple:
+        """Decrypt CMS EnvelopedData from old PKINIT reply (RSA key transport).
+
+        Returns (decrypted_bytes, content_type_oid).
+        """
         ci = cms.ContentInfo.load(enc_key_pack_bytes)
         enveloped_data = ci["content"]
 
@@ -564,9 +567,16 @@ class Authenticate:
         cek = private_key.decrypt(encrypted_key, padding.PKCS1v15())
 
         eci = enveloped_data["encrypted_content_info"]
+        content_type = eci["content_type"].dotted
         algo = eci["content_encryption_algorithm"]
         algo_name = algo["algorithm"].native
         encrypted_content = eci["encrypted_content"].native
+
+        logging.debug(
+            f"EnvelopedData: contentType={content_type}, "
+            f"algo={algo_name}, cek_len={len(cek)}, "
+            f"ct_len={len(encrypted_content)}"
+        )
 
         iv = algo.encryption_iv
 
@@ -574,6 +584,8 @@ class Authenticate:
             cipher_obj = Cipher(algorithms.TripleDES(cek), modes.CBC(iv))
         elif "aes" in algo_name:
             cipher_obj = Cipher(algorithms.AES(cek), modes.CBC(iv))
+        elif "rc2" in algo_name:
+            cipher_obj = Cipher(algorithms.ARC4(cek), modes.CBC(iv))
         else:
             raise ValueError(
                 f"Unsupported content encryption algorithm: {algo_name}"
@@ -590,7 +602,12 @@ class Authenticate:
         ):
             decrypted = decrypted[:-pad_len]
 
-        return decrypted
+        logging.debug(
+            f"Decrypted {len(decrypted)} bytes, "
+            f"first 32: {decrypted[:32].hex()}"
+        )
+
+        return decrypted, content_type
 
     def kerberos_authentication(
         self,
@@ -713,39 +730,51 @@ class Authenticate:
                 return False
 
             enc_key_pack = pk_as_rep.native
-            decrypted = self._decrypt_enveloped_data(enc_key_pack, self.key)
+            decrypted, content_type = self._decrypt_enveloped_data(
+                enc_key_pack, self.key
+            )
 
             # The decrypted content format depends on the KDC:
-            # - OCTET STRING (0x04) wrapping SignedData → unwrap first
+            # - OCTET STRING (0x04) wrapping content → unwrap first
             # - Raw SignedData SEQUENCE (0x30) → parse directly
             # - ContentInfo wrapping SignedData → unwrap ContentInfo
+            # - Raw ReplyKeyPack → parse directly
             inner = decrypted
             if inner[0] == 0x04:
                 inner = core.OctetString.load(inner).native
+                logging.debug(
+                    f"Unwrapped OCTET STRING, inner first 32: "
+                    f"{inner[:32].hex()}"
+                )
 
             reply_key_pack = None
-            for parser in [
-                lambda d: ReplyKeyPack.load(
+            strategies = [
+                ("SignedData", lambda d: ReplyKeyPack.load(
                     cms.SignedData.load(d)[
                         "encap_content_info"
                     ]["content"].native
-                ),
-                lambda d: ReplyKeyPack.load(
+                )),
+                ("ContentInfo>SignedData", lambda d: ReplyKeyPack.load(
                     cms.ContentInfo.load(d)["content"][
                         "encap_content_info"
                     ]["content"].native
-                ),
-                lambda d: ReplyKeyPack.load(d),
-            ]:
+                )),
+                ("raw ReplyKeyPack", lambda d: ReplyKeyPack.load(d)),
+            ]
+            for name, parser in strategies:
                 try:
                     reply_key_pack = parser(inner)
+                    logging.debug(f"Parsed reply via: {name}")
                     break
-                except Exception:
+                except Exception as parse_err:
+                    logging.debug(f"Parse strategy {name} failed: {parse_err}")
                     continue
 
             if reply_key_pack is None:
                 logging.error(
-                    "Failed to parse ReplyKeyPack from decrypted reply"
+                    "Failed to parse ReplyKeyPack from decrypted reply. "
+                    f"contentType={content_type}, "
+                    f"decrypted[0:32]={decrypted[:32].hex()}"
                 )
                 return False
 
